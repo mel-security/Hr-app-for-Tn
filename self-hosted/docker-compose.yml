@@ -1,0 +1,133 @@
+version: '3.8'
+
+services:
+  # ========================
+  # PostgreSQL
+  # ========================
+  postgres:
+    image: postgres:16-alpine
+    container_name: hr-credit-db
+    restart: unless-stopped
+    env_file: ./config.env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hr_credit}
+      POSTGRES_USER: ${POSTGRES_USER:-hr_credit_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./scripts/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hr_credit_user} -d ${POSTGRES_DB:-hr_credit}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hr-credit-net
+
+  # ========================
+  # Application Next.js
+  # ========================
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: hr-credit-app
+    restart: unless-stopped
+    env_file: ./config.env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-hr_credit}
+      POSTGRES_USER: ${POSTGRES_USER:-hr_credit_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      NODE_ENV: production
+      PLAFOND_CREDIT_DEFAUT: ${PLAFOND_CREDIT_DEFAUT:-3000}
+    ports:
+      - "127.0.0.1:${APP_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hr-credit-net
+
+  # ========================
+  # Nginx Reverse Proxy + SSL
+  # ========================
+  nginx:
+    image: nginx:alpine
+    container_name: hr-credit-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - certbot_data:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on:
+      - app
+    networks:
+      - hr-credit-net
+
+  # ========================
+  # Certbot (Let's Encrypt)
+  # ========================
+  certbot:
+    image: certbot/certbot
+    container_name: hr-credit-certbot
+    volumes:
+      - certbot_data:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    networks:
+      - hr-credit-net
+
+  # ========================
+  # Backup (cron-based)
+  # ========================
+  backup:
+    image: postgres:16-alpine
+    container_name: hr-credit-backup
+    restart: unless-stopped
+    env_file: ./config.env
+    environment:
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB:-hr_credit}
+      PGUSER: ${POSTGRES_USER:-hr_credit_user}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - backup_data:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    entrypoint: >
+      /bin/sh -c "chmod +x /backup.sh &&
+      echo '0 ${BACKUP_CRON_HOUR:-2} * * * /backup.sh' | crontab - &&
+      crond -f -l 2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - hr-credit-net
+
+volumes:
+  postgres_data:
+    driver: local
+  certbot_data:
+    driver: local
+  certbot_www:
+    driver: local
+  backup_data:
+    driver: local
+
+networks:
+  hr-credit-net:
+    driver: bridge
